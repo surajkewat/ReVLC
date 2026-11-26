@@ -24,7 +24,7 @@ mod system_windows;
 mod updater;
 mod vlc;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 use bookmarks::{Bookmark, Bookmarks};
@@ -46,6 +46,24 @@ use playlist::{Item, Playlist, Repeat, SortKey};
 use playlist_file::file_uri;
 use settings::{Resume, Settings};
 use vlc::{Chapter, MediaInfo, Navigate, State, Stats, Title, Track, Vlc, event};
+
+/// The volume as saved between launches.
+#[derive(Serialize, Deserialize)]
+struct SavedVolume {
+    volume: i32,
+}
+
+fn volume_file(data_dir: &Path) -> PathBuf {
+    data_dir.join("volume.json")
+}
+
+/// The saved volume, or -1 if there is none (or it can't be read).
+fn load_volume(data_dir: &Path) -> i32 {
+    std::fs::read(volume_file(data_dir))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<SavedVolume>(&bytes).ok())
+        .map_or(-1, |saved| saved.volume.clamp(0, 200))
+}
 
 struct Core {
     vlc: Vlc,
@@ -97,6 +115,11 @@ struct Core {
     history_write: Mutex<()>,
     /// Held while applying a settings change, so changes apply in order.
     settings_change: Mutex<()>,
+    /// The volume the user last set, in percent; negative until they set one.
+    /// The player starts at it, like VLC's saved volume.
+    volume: AtomicI32,
+    /// Set while a write of the volume is waiting to happen.
+    volume_save_queued: AtomicBool,
     /// Equaliser, stereo mode, video effects and zoom; they stay on from
     /// one item to the next.
     effects: Mutex<Effects>,
@@ -334,6 +357,32 @@ impl Core {
     /// the transition lock, which shouldn't wait for the disk.
     fn save_history(&self) {
         let _ = self.history_saves.send(());
+    }
+
+    /// Remembers the volume the user set, and writes it soon. Slider drags
+    /// and held keys change it many times a second, so one write covers them.
+    fn remember_volume(self: &Arc<Self>, volume: i32) {
+        self.volume.store(volume.clamp(0, 200), Ordering::Relaxed);
+        if self.volume_save_queued.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let core = self.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(500));
+            core.flush_volume();
+        });
+    }
+
+    /// Writes the volume now if a write is waiting. Also called on quit, so
+    /// a change made just before it isn't lost.
+    fn flush_volume(&self) {
+        if !self.volume_save_queued.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let volume = self.volume.load(Ordering::Relaxed);
+        if let Err(e) = store::write_json(&volume_file(&self.data_dir), &SavedVolume { volume }, false) {
+            eprintln!("revlc: {e}");
+        }
     }
 
     fn settings(&self) -> MutexGuard<'_, Settings> {
@@ -1590,6 +1639,7 @@ fn next_frame(player: tauri::State<Player>) -> Res {
 fn set_volume(player: tauri::State<Player>, volume: i32) -> Res {
     let core = player.core()?;
     core.vlc.set_volume(volume);
+    core.remember_volume(volume);
     if volume > 0 && core.vlc.muted() {
         core.vlc.set_muted(false);
     }
@@ -2068,6 +2118,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = app.path().app_data_dir()?;
     let languages = preferred_languages();
     let settings = Settings::load(&data_dir);
+    let saved_volume = load_volume(&data_dir);
     // Extra libVLC options for debugging, e.g. REVLC_VLC_ARGS="--verbose=2".
     let args: Vec<String> = std::env::var("REVLC_VLC_ARGS").unwrap_or_default().split_whitespace().map(String::from).collect();
     let mut cli = cli::parse(std::env::args().skip(1));
@@ -2079,6 +2130,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let vlc = match vlc {
         Ok(vlc) => {
             vlc.set_hardware_decoding(settings.hardware_decoding);
+            if saved_volume >= 0 {
+                vlc.set_volume(saved_volume);
+            }
             vlc
         }
         Err(e) => {
@@ -2119,6 +2173,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         history_saves,
         history_write: Mutex::default(),
         settings_change: Mutex::default(),
+        volume: AtomicI32::new(saved_volume),
+        volume_save_queued: AtomicBool::new(false),
         effects: Mutex::default(),
         teletext_page: Mutex::default(),
         start_fullscreen: cli.fullscreen,
@@ -2337,6 +2393,7 @@ pub fn run() {
                 core.save_progress(false);
                 // Now, rather than on the history thread, which quitting doesn't wait for.
                 let _ = core.write_history(true);
+                core.flush_volume();
                 core.quality().close("quit");
             }
             telemetry::flush_on_exit();
@@ -2374,5 +2431,24 @@ mod tests {
         assert!(!in_history("rtsp://user:secret@cam.local/stream"));
         assert!(!in_history("dshow://"));
         assert!(!in_history("avcapture://"));
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+
+    #[test]
+    fn saved_volume_is_read_back_and_bad_files_mean_none() {
+        let dir = std::env::temp_dir().join(format!("revlc-volume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(load_volume(&dir), -1, "nothing saved yet");
+        store::write_json(&volume_file(&dir), &SavedVolume { volume: 135 }, false).unwrap();
+        assert_eq!(load_volume(&dir), 135);
+        store::write_json(&volume_file(&dir), &SavedVolume { volume: 900 }, false).unwrap();
+        assert_eq!(load_volume(&dir), 200, "clamped to VLC's range");
+        std::fs::write(volume_file(&dir), b"nonsense").unwrap();
+        assert_eq!(load_volume(&dir), -1, "a damaged file is ignored");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
